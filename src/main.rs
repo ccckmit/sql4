@@ -1,11 +1,14 @@
 mod btree;
-mod pager;
-mod table;
-mod parser;
-mod planner;
 mod catalog;
 mod fts;
+mod interface;
+mod pager;
+mod parser;
+mod planner;
+mod table;
+
+use interface::Repl;
 
 fn main() {
-    println!("sql4 starting...");
+    Repl::new().run();
 }
