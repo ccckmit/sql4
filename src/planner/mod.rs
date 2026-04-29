@@ -12,5 +12,7 @@ pub mod executor;
 pub mod plan;
 pub mod planner;
 pub mod transaction;
+pub mod constraints;
+pub mod datetime;
 
 pub use executor::{Executor, ResultSet};

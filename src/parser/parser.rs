@@ -70,7 +70,7 @@ impl Parser {
 
     fn parse_statement(&mut self) -> Result<Statement, String> {
         match self.peek().clone() {
-            Token::Select   => Ok(Statement::Select(self.parse_select()?)),
+            Token::Select | Token::With => Ok(Statement::Select(self.parse_select()?)),
             Token::Insert   => Ok(Statement::Insert(self.parse_insert()?)),
             Token::Update   => Ok(Statement::Update(self.parse_update()?)),
             Token::Delete   => Ok(Statement::Delete(self.parse_delete()?)),
@@ -86,13 +86,16 @@ impl Parser {
     // ── SELECT ────────────────────────────────────────────────────────────
 
     fn parse_select(&mut self) -> Result<SelectStmt, String> {
+        // WITH ctes
+        let with = self.parse_with_clause()?;
+
         self.eat(&Token::Select)?;
         let distinct = self.maybe(&Token::Distinct);
 
         let columns = self.parse_select_items()?;
 
         let from = if self.maybe(&Token::From) {
-            Some(self.parse_table_ref()?)
+            Some(self.parse_from_item()?)
         } else { None };
 
         let joins = self.parse_joins()?;
@@ -123,7 +126,7 @@ impl Parser {
             Some(self.parse_expr()?)
         } else { None };
 
-        Ok(SelectStmt { distinct, columns, from, joins, where_, group_by, having, order_by, limit, offset })
+        Ok(SelectStmt { with, distinct, columns, from, joins, where_, group_by, having, order_by, limit, offset })
     }
 
     fn parse_select_items(&mut self) -> Result<Vec<SelectItem>, String> {
@@ -481,6 +484,12 @@ impl Parser {
         } else { false };
         if self.maybe(&Token::In) {
             self.eat(&Token::LParen)?;
+            // IN (SELECT ...) 子查詢
+            if self.check(&Token::Select) || self.check(&Token::With) {
+                let query = self.parse_select()?;
+                self.eat(&Token::RParen)?;
+                return Ok(Expr::InSubquery { expr: Box::new(left), query: Box::new(query), negated: negated_in });
+            }
             let list = self.parse_expr_list()?;
             self.eat(&Token::RParen)?;
             return Ok(Expr::InList { expr: Box::new(left), list, negated: negated_in });
@@ -560,9 +569,23 @@ impl Parser {
             Token::False      => { self.advance(); Ok(Expr::LitBool(false)) }
             Token::LParen => {
                 self.advance();
+                // 純量子查詢 (SELECT ...)
+                if self.check(&Token::Select) || self.check(&Token::With) {
+                    let query = self.parse_select()?;
+                    self.eat(&Token::RParen)?;
+                    return Ok(Expr::ScalarSubquery(Box::new(query)));
+                }
                 let expr = self.parse_expr()?;
                 self.eat(&Token::RParen)?;
                 Ok(expr)
+            }
+            Token::Exists => {
+                self.advance();
+                let negated = false;
+                self.eat(&Token::LParen)?;
+                let query = self.parse_select()?;
+                self.eat(&Token::RParen)?;
+                Ok(Expr::Exists { query: Box::new(query), negated })
             }
             Token::Ident(name) => {
                 self.advance();
@@ -613,6 +636,56 @@ impl Parser {
         while self.maybe(&Token::Comma) { list.push(self.eat_ident()?); }
         Ok(list)
     }
+    // ── WITH / CTE ────────────────────────────────────────────────────────
+
+    fn parse_with_clause(&mut self) -> Result<Vec<crate::parser::ast::Cte>, String> {
+        use crate::parser::ast::Cte;
+        if !self.check(&Token::With) { return Ok(vec![]); }
+        self.advance();
+        self.maybe(&Token::Recursive);
+        let mut ctes = Vec::new();
+        loop {
+            let name = self.eat_ident()?;
+            self.eat(&Token::As)?;
+            self.eat(&Token::LParen)?;
+            let query = self.parse_select()?;
+            self.eat(&Token::RParen)?;
+            ctes.push(Cte { name, query: Box::new(query) });
+            if !self.maybe(&Token::Comma) { break; }
+        }
+        Ok(ctes)
+    }
+
+    // ── FROM item（表名或子查詢） ──────────────────────────────────────────
+
+    fn parse_from_item(&mut self) -> Result<crate::parser::ast::FromItem, String> {
+        use crate::parser::ast::{FromItem, TableRef};
+        if self.check(&Token::LParen) {
+            self.advance();
+            if self.check(&Token::Select) || self.check(&Token::With) {
+                let query = self.parse_select()?;
+                self.eat(&Token::RParen)?;
+                let alias = if self.maybe(&Token::As) {
+                    self.eat_ident()?
+                } else {
+                    self.eat_ident()?
+                };
+                Ok(FromItem::Subquery { query: Box::new(query), alias })
+            } else {
+                let name = self.eat_ident()?;
+                self.eat(&Token::RParen)?;
+                let alias = if self.maybe(&Token::As) { Some(self.eat_ident()?) }
+                    else if let Token::Ident(_) = self.peek() { Some(self.eat_ident()?) }
+                    else { None };
+                Ok(FromItem::Table(TableRef { name, alias }))
+            }
+        } else {
+            let tref = self.parse_table_ref()?;
+            Ok(FromItem::Table(tref))
+        }
+    }
+
+
 }
 
 // 允許某些關鍵字作為識別符
@@ -648,7 +721,12 @@ mod tests {
     #[test]
     fn select_star() {
         let stmts = p("SELECT * FROM users");
-        assert!(matches!(&stmts[0], Statement::Select(s) if s.from.as_ref().unwrap().name == "users"));
+        if let Statement::Select(s) = &stmts[0] {
+            match s.from.as_ref().unwrap() {
+                crate::parser::ast::FromItem::Table(t) => assert_eq!(t.name, "users"),
+                _ => panic!("expected table"),
+            }
+        }
     }
 
     #[test]

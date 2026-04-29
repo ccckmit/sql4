@@ -105,6 +105,18 @@ pub enum Plan {
         stmt: crate::parser::ast::CreateIndexStmt,
     },
 
+    /// 子查詢作為掃描來源（FROM (SELECT ...)）
+    SubqueryScan {
+        query:  Box<Plan>,
+        alias:  String,
+    },
+
+    /// CTE 展開（WITH name AS (query) SELECT ...）
+    Cte {
+        definitions: Vec<(String, Box<Plan>)>,
+        query:       Box<Plan>,
+    },
+
     /// 空計畫（BEGIN / COMMIT / ROLLBACK）
     Transaction(TransactionOp),
 }

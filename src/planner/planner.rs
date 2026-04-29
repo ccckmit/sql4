@@ -36,9 +36,26 @@ impl<'a, S: Storage> Planner<'a, S> {
     // ── SELECT ────────────────────────────────────────────────────────────
 
     fn plan_select(&self, s: SelectStmt) -> Result<Plan, String> {
-        // 1. 掃描來源表
-        let mut plan = if let Some(tref) = s.from {
-            self.plan_table_scan(&tref.name, tref.alias.as_deref(), s.where_.clone())?
+        use crate::parser::ast::FromItem;
+
+        // 0. CTEs → 展開為 Cte 計畫節點
+        let cte_plans: Vec<(String, Box<Plan>)> = s.with.iter()
+            .map(|cte| {
+                let p = self.plan_select(*cte.query.clone())?;
+                Ok((cte.name.clone(), Box::new(p)))
+            })
+            .collect::<Result<_, String>>()?;
+
+        // 1. 掃描來源表或子查詢
+        let mut plan = if let Some(from_item) = s.from {
+            match from_item {
+                FromItem::Table(tref) =>
+                    self.plan_table_scan(&tref.name, tref.alias.as_deref(), s.where_.clone())?,
+                FromItem::Subquery { query, alias } => {
+                    let inner = self.plan_select(*query)?;
+                    Plan::SubqueryScan { query: Box::new(inner), alias }
+                }
+            }
         } else {
             // 無 FROM（如 SELECT 1+1）
             Plan::SeqScan { table: "__dual__".to_string(), alias: None, filter: None }
@@ -97,6 +114,11 @@ impl<'a, S: Storage> Planner<'a, S> {
         // 8. Projection（有 aggregate 時已在 Aggregate 節點處理）
         if !has_agg {
             plan = Plan::Projection { input: Box::new(plan), columns: s.columns };
+        }
+
+        // 若有 CTE，包裝在 Cte 計畫節點
+        if !cte_plans.is_empty() {
+            plan = Plan::Cte { definitions: cte_plans, query: Box::new(plan) };
         }
 
         Ok(plan)

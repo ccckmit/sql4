@@ -9,10 +9,11 @@ use crate::pager::storage::{MemoryStorage, Storage};
 use crate::table::row::{Row, Value};
 use crate::table::Table;
 use super::plan::{InsertSource, JoinKind, Plan, TransactionOp};
+use super::transaction::TransactionManager;
 
 // ── ResultSet ─────────────────────────────────────────────────────────────
 
-#[derive(Debug, Default)]
+#[derive(Debug, Default, Clone)]
 pub struct ResultSet {
     pub columns: Vec<String>,
     pub rows:    Vec<Vec<Value>>,
@@ -47,17 +48,21 @@ impl ResultSet {
 // 未來可以用 trait object 支援 DiskStorage。
 
 pub struct Executor {
-    catalog: Catalog<MemoryStorage>,
-    tables:  HashMap<String, Table<MemoryStorage>>,
-    in_txn:  bool,
+    catalog:     Catalog<MemoryStorage>,
+    tables:      HashMap<String, Table<MemoryStorage>>,
+    txn_mgr:     TransactionManager,
+    cte_cache:   HashMap<String, ResultSet>,
+    constraints: HashMap<String, crate::planner::constraints::TableConstraints>,
 }
 
 impl Executor {
     pub fn new() -> Self {
         Executor {
-            catalog: Catalog::new(MemoryStorage::new()),
-            tables:  HashMap::new(),
-            in_txn:  false,
+            catalog:     Catalog::new(MemoryStorage::new()),
+            tables:      HashMap::new(),
+            txn_mgr:     TransactionManager::new(),
+            cte_cache:   HashMap::new(),
+            constraints: HashMap::new(),
         }
     }
 
@@ -83,18 +88,41 @@ impl Executor {
             Plan::DropTable { name, if_exists }              => self.exec_drop_table(name, if_exists),
             Plan::CreateIndex { .. }                         => Ok(ResultSet::ok_msg("index created")),
             Plan::Transaction(op)                            => self.exec_transaction(op),
+            Plan::SubqueryScan { query, alias }                  => self.exec_subquery_scan(*query, alias),
+            Plan::Cte { definitions, query }                     => self.exec_cte(definitions, *query),
         }
     }
 
     // ── 掃描 ──────────────────────────────────────────────────────────────
 
     fn exec_seq_scan(&mut self, table: &str, filter: Option<Expr>) -> Result<ResultSet, String> {
+        // 無 FROM 的 SELECT（dual 虛擬表）：回傳一列空 row 讓 projection 求值
+        if table == "__dual__" {
+            return Ok(ResultSet { columns: vec![], rows: vec![vec![]] });
+        }
+        // CTE 虛擬表優先
+        if let Some(rs) = self.cte_cache.get(table).cloned() {
+            let col_names = rs.columns.clone();
+            let rows = rs.rows.into_iter()
+                .filter(|row| match &filter {
+                    Some(e) => eval_expr(e, &Row::new(row.clone()), &col_names)
+                        .map(|v| is_truthy(&v)).unwrap_or(false),
+                    None => true,
+                })
+                .collect();
+            return Ok(ResultSet { columns: col_names, rows });
+        }
         let col_names = self.col_names(table)?;
+        // 先 resolve 子查詢（需要在掃描前執行，且需要 &mut self）
+        let resolved_filter = match filter {
+            Some(e) => Some(self.resolve_expr(e)?),
+            None    => None,
+        };
         let tbl = self.get_table(table)?;
         let all = tbl.scan();
 
         let rows = all.into_iter()
-            .filter(|row| match &filter {
+            .filter(|row| match &resolved_filter {
                 Some(e) => eval_expr(e, row, &col_names).map(|v| is_truthy(&v)).unwrap_or(false),
                 None    => true,
             })
@@ -150,10 +178,12 @@ impl Executor {
 
     fn exec_filter(&mut self, input: Plan, expr: Expr) -> Result<ResultSet, String> {
         let src = self.execute(input)?;
+        // 預先解析子查詢（IN subquery, EXISTS, scalar subquery）
+        let resolved = self.resolve_expr(expr)?;
         let rows = src.rows.into_iter()
             .filter(|r| {
                 let row = Row::new(r.clone());
-                eval_expr(&expr, &row, &src.columns).map(|v| is_truthy(&v)).unwrap_or(false)
+                eval_expr(&resolved, &row, &src.columns).map(|v| is_truthy(&v)).unwrap_or(false)
             })
             .collect();
         Ok(ResultSet { columns: src.columns, rows })
@@ -293,6 +323,16 @@ impl Executor {
                 Row::new(rv)
             };
 
+            // 約束檢查
+            if let Some(tc) = self.constraints.get(&table) {
+                let existing = self.tables.get_mut(&table)
+                    .map(|t| t.scan()).unwrap_or_default();
+                let meta = self.catalog.get_table(&table).cloned();
+                if let Some(meta) = meta {
+                    crate::planner::constraints::check_row(&row, &meta.schema, tc, &existing)
+                        .map_err(|e| e)?;
+                }
+            }
             self.get_table(&table)?.insert(row)?;
         }
 
@@ -356,6 +396,8 @@ impl Executor {
             };
             Column::new(&cd.name, dt)
         }).collect();
+        let tc = crate::planner::constraints::constraints_from_ast(&stmt);
+        self.constraints.insert(stmt.name.clone(), tc);
         self.catalog.create_table(&stmt.name, Schema::new(columns))?;
         Ok(ResultSet::ok_msg("table created"))
     }
@@ -370,14 +412,109 @@ impl Executor {
         Ok(ResultSet::ok_msg("table dropped"))
     }
 
+    /// 把運算式中的子查詢預先求值為字面值（需要 &mut self）
+    fn resolve_expr(&mut self, expr: Expr) -> Result<Expr, String> {
+        use crate::parser::ast::*;
+        match expr {
+            Expr::ScalarSubquery(query) => {
+                let plan = crate::planner::planner::Planner::new(&self.catalog).plan(
+                    Statement::Select(*query))?;
+                let rs = self.execute(plan)?;
+                let val = rs.rows.into_iter().next()
+                    .and_then(|r| r.into_iter().next())
+                    .unwrap_or(Value::Null);
+                Ok(expr_from_value(val))
+            }
+            Expr::InSubquery { expr: inner, query, negated } => {
+                let plan = crate::planner::planner::Planner::new(&self.catalog).plan(
+                    Statement::Select(*query))?;
+                let rs = self.execute(plan)?;
+                let list: Vec<Expr> = rs.rows.into_iter()
+                    .filter_map(|r| r.into_iter().next())
+                    .map(expr_from_value)
+                    .collect();
+                Ok(Expr::InList { expr: inner, list, negated })
+            }
+            Expr::Exists { query, negated } => {
+                let plan = crate::planner::planner::Planner::new(&self.catalog).plan(
+                    Statement::Select(*query))?;
+                let rs = self.execute(plan)?;
+                let exists = !rs.rows.is_empty();
+                Ok(Expr::LitBool(if negated { !exists } else { exists }))
+            }
+            Expr::BinOp { left, op, right } => {
+                let left  = self.resolve_expr(*left)?;
+                let right = self.resolve_expr(*right)?;
+                Ok(Expr::BinOp { left: Box::new(left), op, right: Box::new(right) })
+            }
+            other => Ok(other),
+        }
+    }
+
+    fn exec_subquery_scan(&mut self, plan: Plan, alias: String) -> Result<ResultSet, String> {
+        // 執行子查詢，把結果存為暫時「虛擬表」
+        let mut result = self.execute(plan)?;
+        // 給欄位加上 alias 前綴（alias.col）
+        result.columns = result.columns.iter()
+            .map(|c| format!("{}.{}", alias, c))
+            .collect();
+        Ok(result)
+    }
+
+    fn exec_cte(&mut self, defs: Vec<(String, Box<Plan>)>, query: Plan) -> Result<ResultSet, String> {
+        // 依序執行每個 CTE，暫存為虛擬結果集
+        for (name, plan) in defs {
+            let rs = self.execute(*plan)?;
+            // 把 CTE 結果塞進 cte_cache（以 table name 儲存）
+            self.cte_cache.insert(name, rs);
+        }
+        let result = self.execute(query)?;
+        // 清除 CTE 快取（避免污染後續查詢）
+        self.cte_cache.clear();
+        Ok(result)
+    }
+
     fn exec_transaction(&mut self, op: TransactionOp) -> Result<ResultSet, String> {
-        self.in_txn = matches!(op, TransactionOp::Begin);
-        let msg = match op {
-            TransactionOp::Begin    => "transaction begun",
-            TransactionOp::Commit   => "committed",
-            TransactionOp::Rollback => "rolled back",
-        };
-        Ok(ResultSet::ok_msg(msg))
+        match op {
+            TransactionOp::Begin => {
+                // 記錄所有表的 row count snapshot
+                let counts: std::collections::HashMap<String, usize> = self.tables.iter()
+                    .map(|(name, tbl)| (name.clone(), tbl.len()))
+                    .collect();
+                self.txn_mgr.begin(counts)?;
+                Ok(ResultSet::ok_msg("transaction begun"))
+            }
+            TransactionOp::Commit => {
+                self.txn_mgr.commit()?;
+                Ok(ResultSet::ok_msg("committed"))
+            }
+            TransactionOp::Rollback => {
+                let snap = self.txn_mgr.rollback()?;
+                // 還原各表的資料（重建 Table 並截斷到 snapshot 的 row count）
+                // 簡化實作：清除所有在交易中新建或修改的表，從空狀態重建
+                // 完整實作需要 MVCC 或 WAL page-level rollback
+                for (name, count) in &snap.row_counts {
+                    if let Some(tbl) = self.tables.get_mut(name) {
+                        // 把超過 snapshot 的資料截掉（掃描刪除）
+                        let current = tbl.scan();
+                        let to_delete: Vec<_> = current.into_iter()
+                            .skip(*count)
+                            .filter_map(|r| match r.values.first() {
+                                Some(crate::table::row::Value::Integer(v)) =>
+                                    Some(crate::btree::node::Key::Integer(*v)),
+                                Some(crate::table::row::Value::Text(s)) =>
+                                    Some(crate::btree::node::Key::Text(s.clone())),
+                                _ => None,
+                            })
+                            .collect();
+                        for key in to_delete {
+                            tbl.delete(&key);
+                        }
+                    }
+                }
+                Ok(ResultSet::ok_msg("rolled back"))
+            }
+        }
     }
 
     // ── 輔助 ──────────────────────────────────────────────────────────────
@@ -402,6 +539,25 @@ impl Executor {
 }
 
 // ── 運算式求值 ────────────────────────────────────────────────────────────
+
+fn random_i64() -> i64 {
+    // 簡單的線性同餘偽隨機（不需要 rand crate）
+    use std::time::{SystemTime, UNIX_EPOCH};
+    let seed = SystemTime::now().duration_since(UNIX_EPOCH)
+        .unwrap_or_default().subsec_nanos() as i64;
+    seed.wrapping_mul(6364136223846793005).wrapping_add(1442695040888963407)
+}
+
+fn expr_from_value(v: Value) -> crate::parser::ast::Expr {
+    use crate::parser::ast::Expr;
+    match v {
+        Value::Integer(i) => Expr::LitInt(i),
+        Value::Float(f)   => Expr::LitFloat(f),
+        Value::Text(s)    => Expr::LitStr(s),
+        Value::Boolean(b) => Expr::LitBool(b),
+        Value::Null       => Expr::LitNull,
+    }
+}
 
 fn eval_expr(expr: &Expr, row: &Row, cols: &[String]) -> Result<Value, String> {
     match expr {
@@ -460,19 +616,136 @@ fn eval_expr(expr: &Expr, row: &Row, cols: &[String]) -> Result<Value, String> {
             } else { Ok(Value::Boolean(false)) }
         }
 
-        Expr::Function { name, args, .. } => match name.as_str() {
-            "UPPER"    => match eval_expr(&args[0], row, cols)? {
-                Value::Text(s) => Ok(Value::Text(s.to_uppercase())), v => Ok(v) },
-            "LOWER"    => match eval_expr(&args[0], row, cols)? {
-                Value::Text(s) => Ok(Value::Text(s.to_lowercase())), v => Ok(v) },
-            "LENGTH"   => match eval_expr(&args[0], row, cols)? {
-                Value::Text(s) => Ok(Value::Integer(s.len() as i64)), _ => Ok(Value::Null) },
-            "COALESCE" => {
-                for a in args { let v = eval_expr(a, row, cols)?; if !matches!(v, Value::Null) { return Ok(v); } }
-                Ok(Value::Null)
-            },
-            _ => Ok(Value::Null),
+        Expr::Function { name, args, .. } => {
+            // 先把參數求值為字串（日期函式需要）
+            let eval_str_args = || -> Vec<String> {
+                args.iter().map(|a| eval_expr(a, row, cols)
+                    .unwrap_or(Value::Null).to_string()).collect()
+            };
+            match name.as_str() {
+                "UPPER"    => match eval_expr(&args[0], row, cols)? {
+                    Value::Text(s) => Ok(Value::Text(s.to_uppercase())), v => Ok(v) },
+                "LOWER"    => match eval_expr(&args[0], row, cols)? {
+                    Value::Text(s) => Ok(Value::Text(s.to_lowercase())), v => Ok(v) },
+                "LENGTH"   => match eval_expr(&args[0], row, cols)? {
+                    Value::Text(s) => Ok(Value::Integer(s.len() as i64)), _ => Ok(Value::Null) },
+                "ABS"      => match eval_expr(&args[0], row, cols)? {
+                    Value::Integer(i) => Ok(Value::Integer(i.abs())),
+                    Value::Float(f)   => Ok(Value::Float(f.abs())),
+                    v => Ok(v) },
+                "ROUND"    => {
+                    let v = eval_expr(&args[0], row, cols)?;
+                    let digits = if args.len() > 1 {
+                        match eval_expr(&args[1], row, cols)? { Value::Integer(i) => i, _ => 0 }
+                    } else { 0 };
+                    let factor = 10f64.powi(digits as i32);
+                    match v {
+                        Value::Float(f)   => Ok(Value::Float((f * factor).round() / factor)),
+                        Value::Integer(i) => Ok(Value::Integer(i)),
+                        _ => Ok(Value::Null),
+                    }
+                },
+                "CEIL" | "CEILING" => match eval_expr(&args[0], row, cols)? {
+                    Value::Float(f)   => Ok(Value::Float(f.ceil())),
+                    Value::Integer(i) => Ok(Value::Integer(i)),
+                    _ => Ok(Value::Null) },
+                "FLOOR"    => match eval_expr(&args[0], row, cols)? {
+                    Value::Float(f)   => Ok(Value::Float(f.floor())),
+                    Value::Integer(i) => Ok(Value::Integer(i)),
+                    _ => Ok(Value::Null) },
+                "RANDOM"   => Ok(Value::Integer(random_i64())),
+                "TYPEOF"   => {
+                    let v = eval_expr(&args[0], row, cols)?;
+                    Ok(Value::Text(match v {
+                        Value::Integer(_) => "integer", Value::Float(_) => "real",
+                        Value::Text(_) => "text", Value::Null => "null",
+                        Value::Boolean(_) => "integer",
+                    }.to_string()))
+                },
+                "IFNULL" | "NVL" => {
+                    let v = eval_expr(&args[0], row, cols)?;
+                    if matches!(v, Value::Null) { eval_expr(&args[1], row, cols) } else { Ok(v) }
+                },
+                "NULLIF" => {
+                    let a = eval_expr(&args[0], row, cols)?;
+                    let b = eval_expr(&args[1], row, cols)?;
+                    if cmp_val(&a, &b) == std::cmp::Ordering::Equal { Ok(Value::Null) } else { Ok(a) }
+                },
+                "COALESCE" => {
+                    for a in args { let v = eval_expr(a, row, cols)?; if !matches!(v, Value::Null) { return Ok(v); } }
+                    Ok(Value::Null)
+                },
+                "SUBSTR" | "SUBSTRING" => {
+                    if let Value::Text(s) = eval_expr(&args[0], row, cols)? {
+                        let start = match eval_expr(&args[1], row, cols)? { Value::Integer(i) => (i - 1).max(0) as usize, _ => 0 };
+                        let chars: Vec<char> = s.chars().collect();
+                        let result: String = if args.len() > 2 {
+                            let len = match eval_expr(&args[2], row, cols)? { Value::Integer(i) => i as usize, _ => 0 };
+                            chars[start.min(chars.len())..].iter().take(len).collect()
+                        } else {
+                            chars[start.min(chars.len())..].iter().collect()
+                        };
+                        Ok(Value::Text(result))
+                    } else { Ok(Value::Null) }
+                },
+                "TRIM"   => match eval_expr(&args[0], row, cols)? {
+                    Value::Text(s) => Ok(Value::Text(s.trim().to_string())), v => Ok(v) },
+                "LTRIM"  => match eval_expr(&args[0], row, cols)? {
+                    Value::Text(s) => Ok(Value::Text(s.trim_start().to_string())), v => Ok(v) },
+                "RTRIM"  => match eval_expr(&args[0], row, cols)? {
+                    Value::Text(s) => Ok(Value::Text(s.trim_end().to_string())), v => Ok(v) },
+                "REPLACE" => {
+                    if let (Value::Text(s), Value::Text(from), Value::Text(to)) = (
+                        eval_expr(&args[0], row, cols)?,
+                        eval_expr(&args[1], row, cols)?,
+                        eval_expr(&args[2], row, cols)?) {
+                        Ok(Value::Text(s.replace(&from, &to)))
+                    } else { Ok(Value::Null) }
+                },
+                "INSTR" => {
+                    if let (Value::Text(s), Value::Text(needle)) = (
+                        eval_expr(&args[0], row, cols)?, eval_expr(&args[1], row, cols)?) {
+                        Ok(Value::Integer(s.find(&needle).map(|i| i as i64 + 1).unwrap_or(0)))
+                    } else { Ok(Value::Null) }
+                },
+                // ── 日期時間函式 ────────────────────────────────────────
+                "DATE"      => {
+                    let str_args = eval_str_args();
+                    Ok(crate::planner::datetime::fn_date(&str_args)
+                        .map(Value::Text).unwrap_or(Value::Null))
+                },
+                "TIME"      => {
+                    let str_args = eval_str_args();
+                    Ok(crate::planner::datetime::fn_time(&str_args)
+                        .map(Value::Text).unwrap_or(Value::Null))
+                },
+                "DATETIME"  => {
+                    let str_args = eval_str_args();
+                    Ok(crate::planner::datetime::fn_datetime(&str_args)
+                        .map(Value::Text).unwrap_or(Value::Null))
+                },
+                "JULIANDAY" => {
+                    let str_args = eval_str_args();
+                    Ok(crate::planner::datetime::fn_julianday(&str_args)
+                        .map(Value::Float).unwrap_or(Value::Null))
+                },
+                "STRFTIME"  => {
+                    let str_args = eval_str_args();
+                    Ok(crate::planner::datetime::fn_strftime(&str_args)
+                        .map(Value::Text).unwrap_or(Value::Null))
+                },
+                "NOW"       => Ok(Value::Text(
+                    crate::planner::datetime::fn_datetime(&vec!["now".into()])
+                        .unwrap_or_default())),
+                _ => Ok(Value::Null),
+            }
         },
+
+        Expr::ScalarSubquery(_) | Expr::InSubquery { .. } | Expr::Exists { .. } => {
+            // 子查詢 expr 需要 Executor，在 exec_subquery_expr 中處理
+            // 這裡回傳 sentinel，呼叫端應先透過 resolve_subquery_exprs 預處理
+            Err("subquery expressions must be resolved before eval_expr".to_string())
+        }
 
         _ => Err(format!("unsupported expr: {:?}", expr)),
     }
@@ -548,6 +821,12 @@ fn eval_literal(expr: &Expr) -> Result<Value, String> {
         Expr::LitStr(s)   => Ok(Value::Text(s.clone())),
         Expr::LitBool(b)  => Ok(Value::Boolean(*b)),
         Expr::LitNull     => Ok(Value::Null),
+        // 負數字面值（parser 會產生 UnaryOp Neg）
+        Expr::UnaryOp { op: UnaryOp::Neg, expr } => match eval_literal(expr)? {
+            Value::Integer(i) => Ok(Value::Integer(-i)),
+            Value::Float(f)   => Ok(Value::Float(-f)),
+            v => Err(format!("cannot negate {:?}", v)),
+        },
         _ => Err(format!("expected literal, got {:?}", expr)),
     }
 }
@@ -778,5 +1057,121 @@ mod tests {
         let mut e = setup();
         let r = run(&mut e, "SELECT UPPER(name) FROM users WHERE id = 1");
         assert_eq!(r.rows[0][0], Value::Text("ALICE".into()));
+    }
+
+    #[test]
+    fn math_functions() {
+        let mut e = Executor::new();
+        run(&mut e, "CREATE TABLE t (id INTEGER, val REAL)");
+        run(&mut e, "INSERT INTO t VALUES (1, -3.7)");
+        let r = run(&mut e, "SELECT ABS(val), ROUND(val, 1), CEIL(val), FLOOR(val) FROM t");
+        assert_eq!(r.rows[0][0], Value::Float(3.7));
+        assert_eq!(r.rows[0][1], Value::Float(-3.7));
+        assert_eq!(r.rows[0][2], Value::Float(-3.0));
+        assert_eq!(r.rows[0][3], Value::Float(-4.0));
+    }
+
+    #[test]
+    fn string_functions_extended() {
+        let mut e = setup();
+        let r = run(&mut e, "SELECT SUBSTR(name, 1, 3) FROM users WHERE id = 1");
+        assert_eq!(r.rows[0][0], Value::Text("Ali".into()));
+        let r = run(&mut e, "SELECT TRIM('  hello  ')");
+        assert_eq!(r.rows[0][0], Value::Text("hello".into()));
+        let r = run(&mut e, "SELECT REPLACE(name, 'Alice', 'Alicia') FROM users WHERE id = 1");
+        assert_eq!(r.rows[0][0], Value::Text("Alicia".into()));
+        let r = run(&mut e, "SELECT LENGTH(name) FROM users WHERE id = 1");
+        assert_eq!(r.rows[0][0], Value::Integer(5));
+    }
+
+    #[test]
+    fn datetime_functions() {
+        let mut e = Executor::new();
+        run(&mut e, "CREATE TABLE events (id INTEGER, dt TEXT)");
+        run(&mut e, "INSERT INTO events VALUES (1, '2024-03-15 10:30:00')");
+        let r = run(&mut e, "SELECT DATE(dt), TIME(dt) FROM events WHERE id = 1");
+        assert_eq!(r.rows[0][0], Value::Text("2024-03-15".into()));
+        assert_eq!(r.rows[0][1], Value::Text("10:30:00".into()));
+        let r = run(&mut e, "SELECT DATE('2024-03-15', '+5 days') FROM events WHERE id = 1");
+        assert_eq!(r.rows[0][0], Value::Text("2024-03-20".into()));
+        let r = run(&mut e, "SELECT STRFTIME('%Y/%m/%d', dt) FROM events WHERE id = 1");
+        assert_eq!(r.rows[0][0], Value::Text("2024/03/15".into()));
+    }
+
+    #[test]
+    fn not_null_constraint() {
+        let mut e = Executor::new();
+        run(&mut e, "CREATE TABLE t (id INTEGER, name TEXT NOT NULL)");
+        let stmts = crate::parser::parse("INSERT INTO t VALUES (1, NULL)").unwrap();
+        let plan = crate::planner::planner::Planner::new(e.catalog()).plan(stmts.into_iter().next().unwrap()).unwrap();
+        assert!(e.execute(plan).is_err(), "NOT NULL should reject NULL");
+        // non-null should succeed
+        run(&mut e, "INSERT INTO t VALUES (2, 'Alice')");
+        let r = run(&mut e, "SELECT * FROM t");
+        assert_eq!(r.row_count(), 1);
+    }
+
+    #[test]
+    fn unique_constraint() {
+        let mut e = Executor::new();
+        run(&mut e, "CREATE TABLE t (id INTEGER, email TEXT UNIQUE)");
+        run(&mut e, "INSERT INTO t VALUES (1, 'alice@test.com')");
+        let stmts = crate::parser::parse("INSERT INTO t VALUES (2, 'alice@test.com')").unwrap();
+        let plan = crate::planner::planner::Planner::new(e.catalog()).plan(stmts.into_iter().next().unwrap()).unwrap();
+        assert!(e.execute(plan).is_err(), "UNIQUE should reject duplicate");
+    }
+
+    #[test]
+    fn subquery_in_where() {
+        let mut e = setup();
+        // IN subquery
+        let r = run(&mut e, "SELECT * FROM users WHERE id IN (SELECT id FROM users WHERE age > 28)");
+        // Alice(30) and Carol(35) qualify
+        assert_eq!(r.row_count(), 2);
+    }
+
+    #[test]
+    fn scalar_subquery() {
+        let mut e = setup();
+        let r = run(&mut e, "SELECT name FROM users WHERE age = (SELECT MAX(age) FROM users)");
+        assert_eq!(r.row_count(), 1);
+        assert_eq!(r.rows[0][0], Value::Text("Carol".into()));
+    }
+
+    #[test]
+    fn cte_basic() {
+        let mut e = setup();
+        let r = run(&mut e, "WITH old_users AS (SELECT * FROM users WHERE age >= 30) SELECT name FROM old_users");
+        // Alice(30) and Carol(35)
+        assert_eq!(r.row_count(), 2);
+    }
+
+    #[test]
+    fn cte_chained() {
+        let mut e = setup();
+        let r = run(&mut e,
+            "WITH u AS (SELECT * FROM users WHERE age > 20),                   old AS (SELECT * FROM u WHERE age >= 30)              SELECT name FROM old ORDER BY name ASC");
+        assert_eq!(r.row_count(), 2);
+        assert_eq!(r.rows[0][0], Value::Text("Alice".into()));
+    }
+
+    #[test]
+    fn ifnull_coalesce() {
+        let mut e = Executor::new();
+        run(&mut e, "CREATE TABLE t (id INTEGER, val TEXT)");
+        run(&mut e, "INSERT INTO t VALUES (1, NULL)");
+        let r = run(&mut e, "SELECT IFNULL(val, 'default') FROM t");
+        assert_eq!(r.rows[0][0], Value::Text("default".into()));
+        let r = run(&mut e, "SELECT COALESCE(val, 'fallback') FROM t");
+        assert_eq!(r.rows[0][0], Value::Text("fallback".into()));
+    }
+
+    #[test]
+    fn nullif_test() {
+        let mut e = setup();
+        let r = run(&mut e, "SELECT NULLIF(age, 30) FROM users WHERE id = 1");
+        assert_eq!(r.rows[0][0], Value::Null);
+        let r = run(&mut e, "SELECT NULLIF(age, 99) FROM users WHERE id = 1");
+        assert_eq!(r.rows[0][0], Value::Integer(30));
     }
 }

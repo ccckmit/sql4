@@ -20,9 +20,10 @@ pub enum Statement {
 
 #[derive(Debug, Clone, PartialEq)]
 pub struct SelectStmt {
+    pub with:      Vec<Cte>,            // WITH ... AS (...)
     pub distinct:  bool,
     pub columns:   Vec<SelectItem>,
-    pub from:      Option<TableRef>,
+    pub from:      Option<FromItem>,    // table name 或子查詢
     pub joins:     Vec<Join>,
     pub where_:    Option<Expr>,
     pub group_by:  Vec<Expr>,
@@ -45,10 +46,24 @@ pub struct TableRef {
     pub alias: Option<String>,
 }
 
+/// FROM 子句可以是資料表名稱或子查詢
+#[derive(Debug, Clone, PartialEq)]
+pub enum FromItem {
+    Table(TableRef),
+    Subquery { query: Box<SelectStmt>, alias: String },
+}
+
+/// CTE（Common Table Expression）定義：WITH name AS (query)
+#[derive(Debug, Clone, PartialEq)]
+pub struct Cte {
+    pub name:  String,
+    pub query: Box<SelectStmt>,
+}
+
 #[derive(Debug, Clone, PartialEq)]
 pub struct Join {
     pub kind:      JoinKind,
-    pub table:     TableRef,
+    pub table:     TableRef,   // 暫保留 TableRef，子查詢 JOIN 後續擴充
     pub condition: JoinCondition,
 }
 
@@ -181,6 +196,15 @@ pub enum Expr {
 
     // IN (...)
     InList  { expr: Box<Expr>, list: Vec<Expr>, negated: bool },
+
+    // IN (SELECT ...)
+    InSubquery { expr: Box<Expr>, query: Box<SelectStmt>, negated: bool },
+
+    // EXISTS (SELECT ...)
+    Exists { query: Box<SelectStmt>, negated: bool },
+
+    // 純量子查詢 (SELECT ...)
+    ScalarSubquery(Box<SelectStmt>),
 
     // LIKE
     Like    { expr: Box<Expr>, pattern: Box<Expr>, negated: bool },

@@ -18,6 +18,7 @@ pub enum Token {
     Having, Distinct, All, As, If, Exists,
     Begin, Commit, Rollback, Transaction,
     Virtual, Match,  // FTS5
+    With, Recursive,  // CTE
     KwInteger, KwText,       // 型別關鍵字
     Real, Blob, Boolean,
     True, False,
@@ -112,6 +113,8 @@ fn keyword(s: &str) -> Option<Token> {
         "TRANSACTION" => Some(Token::Transaction),
         "VIRTUAL"     => Some(Token::Virtual),
         "MATCH"       => Some(Token::Match),
+        "WITH"        => Some(Token::With),
+        "RECURSIVE"   => Some(Token::Recursive),
         "INTEGER"     => Some(Token::KwInteger),
         "INT"         => Some(Token::KwInteger),
         "TEXT"        => Some(Token::KwText),
