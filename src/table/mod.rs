@@ -5,6 +5,4 @@ pub mod schema;
 pub mod serialize;
 pub mod table;
 
-pub use row::{Row, Value};
-pub use schema::{Column, DataType, Schema};
 pub use table::Table;

@@ -28,6 +28,4 @@ pub mod fts_table;
 pub mod index;
 pub mod tokenizer;
 
-pub use fts_table::{FtsTable, MatchQuery, parse_match_query};
-pub use index::InvertedIndex;
-pub use tokenizer::Tokenizer;
+pub use fts_table::FtsTable;

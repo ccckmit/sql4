@@ -9,7 +9,7 @@
 //! 約束在 INSERT / UPDATE 時檢查，違反時回傳 Err。
 
 use crate::table::row::{Row, Value};
-use crate::table::schema::{Column, Schema};
+use crate::table::schema::Schema;
 
 // ── 約束定義（執行期） ────────────────────────────────────────────────────
 

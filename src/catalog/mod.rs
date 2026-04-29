@@ -7,4 +7,3 @@ pub mod catalog;
 pub mod meta;
 
 pub use catalog::Catalog;
-pub use meta::TableMeta;

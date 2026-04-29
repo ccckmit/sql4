@@ -5,7 +5,7 @@ use std::collections::HashMap;
 use crate::btree::node::Key;
 use crate::catalog::Catalog;
 use crate::parser::ast::{BinOp, Expr, SelectItem, UnaryOp};
-use crate::pager::storage::{MemoryStorage, Storage};
+use crate::pager::storage::MemoryStorage;
 use crate::table::row::{Row, Value};
 use crate::table::Table;
 use super::plan::{InsertSource, JoinKind, Plan, TransactionOp};
@@ -529,7 +529,7 @@ impl Executor {
         if !self.tables.contains_key(name) {
             let meta = self.catalog.get_table(name)
                 .ok_or_else(|| format!("table '{}' not found", name))?.clone();
-            let mut tbl = Table::new(name, meta.schema.clone(), MemoryStorage::new());
+            let tbl = Table::new(name, meta.schema.clone(), MemoryStorage::new());
             let root = tbl.root_page();
             self.catalog.update_table_meta(name, root, 0)?;
             self.tables.insert(name.to_string(), tbl);
